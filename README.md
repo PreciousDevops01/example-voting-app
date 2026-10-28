@@ -1,12 +1,28 @@
-# Capstone 1: Ship It (Voting App on EKS)
+# Capstone 1: Automated EKS Deployment Pipeline (Voting App)
 
-Fork of [dockersamples/example-voting-app](https://github.com/dockersamples/example-voting-app), taken from a local `docker compose` demo to an automatically deployed service on AWS EKS.
+This repository transforms the classic [dockersamples/example-voting-app](https://github.com/dockersamples/example-voting-app) from a local container setup into a fully automated, cloud-native application running on **AWS Elastic Kubernetes Service (EKS)**.
 
-One push to `main` now tests, scans, builds, pushes and deploys the app. The whole environment can be destroyed and rebuilt from code in about 10 minutes.
+A single commit pushed to the `main` branch triggers an end-to-end pipeline that tests, security-scans, builds, pushes, and deploys the entire application stack. Furthermore, the complete cloud environment can be torn down and rebuilt from infrastructure-as-code in under 10 minutes.
 
-**Starting point:** the Terraform, Helm chart, pipeline and worker Dockerfile began from a community starter kit shared in the cohort with the instructor's approval. I customised the cluster size and Kubernetes version, the chart values and templates, the pipeline jobs, and the container hardening.
+> **Note on Origins:** While the core structural foundation (Terraform scripts, base Helm chart, pipeline skeleton, and worker Dockerfile) originated from an approved community starter template provided for the cohort, all sizing parameters, Kubernetes version choices, Helm templates/values, hardening measures, and pipeline steps have been heavily customized.
 
-## Architecture
+---
+
+## Table of Contents
+
+- [System Architecture](#system-architecture)
+- [Repository Structure](#repository-structure)
+- [Infrastructure Management (Terraform)](#infrastructure-management-terraform)
+- [Container Security & Hardening](#container-security--hardening)
+- [CI/CD Pipeline (GitHub Actions)](#cicd-pipeline-github-actions)
+- [Secrets Management](#secrets-management)
+- [Deployment & Verification](#deployment--verification)
+- [Resilience & Rollback Testing](#resilience--rollback-testing)
+- [Known Limitations & Future Improvements](#known-limitations--future-improvements)
+
+---
+
+## System Architecture
 
 ```mermaid
 flowchart LR
@@ -26,23 +42,37 @@ flowchart LR
   end
 ```
 
-How a vote travels: the vote page puts the vote in Redis, the worker moves it into PostgreSQL, and the result page reads the totals from PostgreSQL.
+### Data Path Workflow
 
-## What is in this repo
+1. Users submit a choice on the **vote** web interface, which queues the vote inside **Redis**.
+2. The background **worker** service consumes the queue item and persists it into **PostgreSQL**.
+3. The **result** interface fetches live aggregate counts directly from PostgreSQL.
 
-| Path | Purpose |
+---
+
+## Repository Structure
+
+| Directory / File | Description |
 |---|---|
-| `vote/`, `result/`, `worker/` | The three app services and their Dockerfiles |
-| `terraform/` | EKS cluster in the default VPC, plus IAM roles and a managed node group |
-| `helm/voting-app/` | One Helm chart and one values file for all five workloads |
-| `.github/workflows/deploy.yml` | The CI/CD pipeline |
-| `docs/screenshots/` | Evidence for each step |
+| `vote/`, `result/`, `worker/` | Source code and customized Dockerfiles for the three application services |
+| `terraform/` | Infrastructure-as-code defining the EKS cluster, managed node groups, and IAM boundaries |
+| `helm/voting-app/` | Consolidated Helm chart and values configuration managing all five workloads |
+| `.github/workflows/deploy.yml` | Automated GitHub Actions CI/CD pipeline definition |
+| `docs/screenshots/` | Visual execution records for verification stages |
 
-## Infrastructure (Terraform)
+---
 
-- Region `eu-west-1`, cluster `david-capstone-cluster`, Kubernetes 1.34
-- Managed node group of 2 x `t3.large` (min 1, max 3), in the default VPC
-- The kit defaults were changed: `t3.small` was too small for Capstone 2, and Kubernetes 1.30 is no longer offered
+## Infrastructure Management (Terraform)
+
+| Setting | Value |
+|---|---|
+| **Cloud Region** | `eu-west-1` |
+| **Cluster Identifier** | `david-capstone-cluster` (Kubernetes version 1.34) |
+| **Compute Resources** | Managed node group of 2 x `t3.large` instances (autoscaling: min 1, max 3) in the default VPC |
+
+**Deviations from defaults:** Upgraded from `t3.small` to support downstream scaling requirements, and targeted Kubernetes 1.34 as older versions (such as 1.30) are deprecated.
+
+### Provisioning & Rebuild Commands
 
 ```bash
 cd terraform
@@ -53,47 +83,59 @@ aws eks update-kubeconfig --name david-capstone-cluster --region eu-west-1
 kubectl get nodes
 ```
 
-### Rebuild from code
+### Disaster Recovery / Rebuild Benchmarks
 
-I destroyed the cluster with `terraform destroy` and recreated it with `terraform apply`, twice.
+The environment was successfully torn down and re-provisioned from scratch multiple times.
 
-| Step | Time |
+| Operation | Timing |
 |---|---|
-| Destroy | node group about 8 minutes, cluster about 2.5 minutes (10 resources) |
-| Recreate | cluster 8m04s, node group 1m44s, total 9m57s (10 resources) |
+| **Tear down** (`terraform destroy`) | Node group (~8m), cluster (~2.5m), total ~10 resources |
+| **Re-creation** (`terraform apply`) | Cluster (8m04s), node group (1m44s), **total: 9m57s** |
 
-After the recreate, a push to `main` redeployed the app with no manual steps beyond adding the GitHub secrets.
+Post-recreation, pushing to `main` immediately restored application functionality with zero manual intervention aside from configuring pipeline secrets.
 
-## Containers
+---
 
-- Base images are pinned to a version tag (`python:3.11-slim`, `node:18-slim`, `dotnet/sdk:7.0` and `dotnet/runtime:7.0`)
-- Every service runs as a non-root user: `vote` and `worker` as uid 10001, `result` as the `node` user
-- Each service has a `.dockerignore`
-- The production image of `vote` is the `final` stage (gunicorn), not the `dev` stage that docker compose uses
-- Non-root processes cannot bind port 80 on Kubernetes by default, so the `vote` and `result` pods set the sysctl `net.ipv4.ip_unprivileged_port_start=0`
+## Container Security & Hardening
 
-## Pipeline (GitHub Actions)
+- **Explicit Version Pinning:** Base images reference strict version tags (`python:3.11-slim`, `node:18-slim`, `dotnet/sdk:7.0`, and `dotnet/runtime:7.0`).
+- **Non-Root Execution:** All workloads operate under restricted privileges (`vote` and `worker` run as UID `10001`, while `result` executes under the standard `node` user).
+- **Build Context Optimization:** Every service directory includes an optimized `.dockerignore` file.
+- **Production Build Stages:** The `vote` image uses a multi-stage build, deploying the production-ready `gunicorn` runner stage rather than local development configurations.
+- **Unprivileged Port Binding:** To comply with strict non-root constraints on Kubernetes, pods configure the container sysctl parameter `net.ipv4.ip_unprivileged_port_start=0` to bind to restricted ports safely.
 
-`.github/workflows/deploy.yml` runs on every push to `main`:
+---
 
-1. **Smoke test:** brings up the stack with docker compose and checks that the vote and result pages respond. The upstream project has no unit tests, so this is the test that exists.
-2. **Trivy scan:** scans the repository for vulnerabilities and secrets (CRITICAL and HIGH, unfixed ignored). It runs in report-only mode and does not fail the build yet. Trivy runs from a pinned container image instead of the trivy-action.
-3. **Build and push:** three parallel jobs build `vote`, `result` and `worker` and push them to Docker Hub as `davidblitx/examplevotingapp_<service>:<commit SHA>` (plus `latest`).
-4. **Deploy:** configures AWS credentials, connects to the cluster and runs `helm upgrade --install` with `--set global.tag=<commit SHA>`, so the cluster always runs the exact commit that was built.
+## CI/CD Pipeline (GitHub Actions)
 
-Jobs 3 and 4 only run on pushes to `main`. A full run takes about 2m20s.
+The workflow defined in `.github/workflows/deploy.yml` executes automatically on every update to `main`:
 
-![Green pipeline run](docs/screenshots/01-pipeline-green.png)
-![Trivy scan](docs/screenshots/02-trivy-scan.png)
-![Docker Hub tags](docs/screenshots/07-dockerhub-tags.png)
+1. **Smoke Testing:** Initializes the application stack using Docker Compose to verify basic response viability for both frontends (serving as a test suite since none exists upstream).
+2. **Vulnerability Assessment:** Executes [Trivy](https://github.com/aquasecurity/trivy) to scan repository files for code vulnerabilities and exposed secrets (`CRITICAL` and `HIGH` severities evaluated in report-only mode).
+3. **Container Build & Registry Push:** Concurrently builds images for `vote`, `result`, and `worker`, tagging them with the git commit SHA alongside a `latest` tag on Docker Hub:
+   `davidblitx/examplevotingapp_<service>:<commit SHA>`
+4. **Automated Kubernetes Deployment:** Authenticates with AWS, targets the EKS cluster, and runs `helm upgrade --install` with `--set global.tag=<commit SHA>` to ensure absolute version parity with the built commit.
 
-### Secrets
+**Total pipeline execution time averages approximately 2 minutes 20 seconds.**
 
-No secrets are stored in Git. These GitHub Actions secrets are used: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. Terraform state, plan files and the `.terraform/` directory are excluded by `terraform/.gitignore`.
+---
 
-## Deploy and use
+## Secrets Management
 
-After a push, the pipeline deploys automatically. To check it and open the app:
+No sensitive credentials exist within version control. Authentication relies entirely on **GitHub Actions Secrets**:
+
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+
+Terraform execution artifacts and local state directories are globally excluded via `.gitignore`.
+
+---
+
+## Deployment & Verification
+
+Once deployed via the automated pipeline, pods can be monitored and accessed via local port-forwarding:
 
 ```bash
 kubectl get pods
@@ -101,14 +143,14 @@ kubectl port-forward svc/vote 8080:5000
 kubectl port-forward svc/result 8081:5001
 ```
 
-Vote at http://localhost:8080 and watch the totals at http://localhost:8081.
+- Access the voting portal at <http://localhost:8080>
+- Monitor live vote tallies at <http://localhost:8081>
 
-![Pods running](docs/screenshots/03-pods-running.png)
-![Vote and result pages](docs/screenshots/04-vote-result-pages.png)
+---
 
-## Rollback
+## Resilience & Rollback Testing
 
-I shipped a bad release on purpose by pointing the chart at an image tag that does not exist:
+To test recovery workflows, a deliberately broken deployment was pushed targeting a non-existent container tag:
 
 ```bash
 helm upgrade voting-app ./helm/voting-app --set global.tag=doesnotexist --wait --timeout 60s
@@ -117,19 +159,18 @@ helm history voting-app
 helm rollback voting-app 1 --wait
 ```
 
-What happened:
+### Observed Behavior
 
-- Helm reported `UPGRADE FAILED` after 60 seconds, and revision 10 was marked `failed`
-- The new pods sat in `ImagePullBackOff`, while the old pods kept running, so the app stayed up
-- `helm rollback voting-app 1` restored the last good release as revision 11, and all five pods were healthy again
+- Helm flagged a timeout failure (`UPGRADE FAILED` after 60s), transitioning the deployment revision to a `failed` state.
+- Newly scheduled pods entered an `ImagePullBackOff` loop, while the existing stable pods continued servicing traffic uninterrupted (**zero downtime**).
+- Executing `helm rollback voting-app 1` reverted the release to the previous stable revision, instantly restoring complete cluster health.
 
-![Bad release](docs/screenshots/05-bad-release.png)
-![Rollback](docs/screenshots/06-rollback.png)
+---
 
-## Known limitations
+## Known Limitations & Future Improvements
 
-- **Database password:** the PostgreSQL credentials are the upstream defaults (`postgres`/`postgres`) and appear in `helm/voting-app/values.yaml`. The upstream application hardcodes them, so changing them would mean changing application code. The database is a `ClusterIP` service and is not reachable from outside the cluster.
-- **Trivy is report-only:** it scans repository files, not the built images, and it does not block the build. Gating on image scans is the next step.
-- **End-of-life base images:** Node 18 and .NET 7 are past end of life. They were kept so the application builds unchanged.
-- **AWS credentials:** the pipeline uses long-lived access keys stored as GitHub secrets. OIDC with a short-lived role would be the better production setup.
-- **Access to the app:** the services are exposed with port-forward for the demo. Ingress and a load balancer were left out of scope.
+- **Hardcoded Database Credentials:** Default upstream PostgreSQL credentials (`postgres/postgres`) are present within `values.yaml` due to application-level hardcoding. Mitigation requires code-level refactoring. The database remains isolated inside a `ClusterIP` service boundary.
+- **Passive Security Scanning:** Trivy currently evaluates repository artifacts rather than runtime container images, and operates in report-only mode without failing the pipeline.
+- **End-of-Life Base Runtimes:** Legacy runtimes (Node 18 and .NET 7) are retained strictly to preserve upstream build stability.
+- **Static Cloud Credentials:** The pipeline currently relies on long-lived programmatic IAM keys. Transitioning to short-lived OpenID Connect (OIDC) federation is the ideal production architecture.
+- **Demo Traffic Routing:** Public ingress routing and cloud load balancers were descoped in favor of local port-forwarding for demonstration convenience.
